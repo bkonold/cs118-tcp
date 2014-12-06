@@ -13,7 +13,7 @@ process for each connection
 #include <sys/wait.h> /* for the waitpid() system call */
 #include <signal.h> /* signal name macros, and the kill() prototype */
 #include <unistd.h>
-#include <time.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -37,10 +37,33 @@ void error(char *msg)
 }
 
 void
-save_file_and_exit(vector<Packet> packets, char* filename, int sockfd, struct sockaddr_in dest_addr) {
+send_packet(Packet pkt, int sockfd, struct sockaddr_in destAddr) {
+    if (pkt.isRequest()) {
+        string request(pkt.getData(), pkt.getDataLen());
+        printf("Sending REQUEST with filename: %s\n", request.c_str());
+    }
+    else if (pkt.isACK()) {
+        printf("Sending ACK with ACKNUM: %d\n", pkt.getAckNum());
+    }
+    else if (pkt.isEOF_ACK()) {
+        printf("Sending EOF ACK\n");
+    }
+
+    int serializedLength;
+    char* buffer = pkt.serialize(&serializedLength);
+    int bytesSent = sendto(sockfd, (void*)buffer, serializedLength, 0, (struct sockaddr *)&destAddr, sizeof(destAddr));
+    free(buffer);
+
+    if (bytesSent < 0) {
+        error("ERROR on sending packet");
+    }
+}
+
+void
+save_file_and_exit(vector<Packet> packets, char* filename, int sockfd, struct sockaddr_in destAddr) {
     FILE* file = fopen(filename, "w");
     if (!file) {
-        error("could not open file for writing");
+        error("ERROR: could not open file for writing");
     }
 
     int fileLength = 0;
@@ -49,53 +72,64 @@ save_file_and_exit(vector<Packet> packets, char* filename, int sockfd, struct so
     }
 
     char* buffer = (char*)malloc(fileLength);
+    int totalSize = 0;
     for (int i = 0; i < packets.size(); ++i) {
         for (int j = 0; j < packets[i].getDataLen(); ++j) {
-            buffer[(i * DATA_LEN) + j] = packets[i].getData()[j];
+            buffer[totalSize + j] = packets[i].getData()[j];
         }
+        totalSize += packets[i].getDataLen();
     }
 
     int bytesWritten = fwrite(buffer, sizeof(char), fileLength, file);
     if (bytesWritten != fileLength) {
-        error("writing to file failed");
+        error("ERROR: writing to file failed");
     }
+
+    free(buffer);
+    fclose(file);
 
     Packet ackPkt(-1, EOF_ACK, NULL, 0);
-    printf("Sending ACK with ACK number: %d\n", ackPkt.getAckNum());
-    int serializedLength;
-    char* ackbuf = ackPkt.serialize(&serializedLength);
-    int bytesSent = sendto(sockfd, (void*)ackbuf, serializedLength, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    send_packet(ackPkt, sockfd, destAddr);
 
-    if (bytesSent < 0) {
-        error("ERROR on sending ack");
-    }
-
-    time_t t = time(0);
+    struct timeval timeVal;
+    gettimeofday(&timeVal, NULL);
+    long t = timeVal.tv_usec/1000 + timeVal.tv_sec*1000;
     char packetData[2048];
     while (1) {
-        struct sockaddr_in cli_addr;
-        socklen_t cli_len;
-        int packetDataLength = recvfrom(sockfd, packetData, 2048, 0, (struct sockaddr *) &cli_addr, &cli_len);
-        // TODO potentially check that you got eof ack from proper server
+        struct sockaddr_in servAddr;
+        socklen_t servLen = sizeof(servAddr);
+        int packetDataLength = recvfrom(sockfd, packetData, 2048, 0, (struct sockaddr *) &servAddr, &servLen);
+
+        int r = (rand() % 100) + 1;
+        if (r <= PROBABILITY_PACKET_LOST * 100) {
+            continue;
+        }
+        r = (rand() % 100) + 1;
+        if (r <= PROBABILITY_PACKET_CORRUPT * 100) {
+            continue;
+        }
+
         if (packetDataLength < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 error("ERROR on recvfrom");
             }
-            continue;
-        }
-        else if (packetDataLength > 0) {
-            Packet pkt(packetData, packetDataLength);
-            if (pkt.isEOF_ACK()) {
-                exit(0);
+            gettimeofday(&timeVal, NULL);
+            long now = timeVal.tv_usec/1000 + timeVal.tv_sec*1000;
+            // check for timeout, otherwise just go back and try recvfrom again
+            if (now - t > TIMEOUT) {
+                Packet eofAckPkt(-1, EOF_ACK, NULL, 0);
+                printf("TIMEOUT waiting for EOF ACK. RETRANSMISSION: ");
+                send_packet(eofAckPkt, sockfd, destAddr);
+                t = now;
             }
         }
-        if (time(0) - t > TIMEOUT) {
-            Packet eofAckPkt(-1, EOF_ACK, NULL, 0);
-            printf("Sending ACK with ACK number: %d\n", eofAckPkt.getAckNum());
-            int eofAckSerLen;
-            char* eofAckBuf = eofAckPkt.serialize(&eofAckSerLen);
-            int bytesSent = sendto(sockfd, (void*)eofAckBuf, eofAckSerLen, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-            t = time(0);
+        else if (packetDataLength > 0) {
+            if (servAddr.sin_port == destAddr.sin_port && servAddr.sin_addr.s_addr == destAddr.sin_addr.s_addr) {
+                Packet pkt(packetData, packetDataLength);
+                if (!pkt.isCorrupt() && pkt.isEOF_ACK()) {
+                    exit(0);
+                }
+            }
         }
     }
 }
@@ -103,9 +137,9 @@ save_file_and_exit(vector<Packet> packets, char* filename, int sockfd, struct so
 int main(int argc, char *argv[])
 {
     srand(time(0));
-    int sockfd, newsockfd, portno, pid;
-    socklen_t clilen;
-    struct sockaddr_in serv_addr, cli_addr;
+    int sockfd, portno;
+    struct sockaddr_in recvAddr, servAddr;
+    socklen_t servLen = sizeof(servAddr);
     struct sigaction sa;          // for signal SIGCHLD
 
     if (argc < 4) {
@@ -117,17 +151,15 @@ int main(int argc, char *argv[])
         error("ERROR opening socket");
     }
     fcntl(sockfd, F_SETFL, O_NONBLOCK);
-    bzero((char *) &serv_addr, sizeof(serv_addr));
+    bzero((char *) &recvAddr, sizeof(recvAddr));
     portno = 48120;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = INADDR_ANY;
-    serv_addr.sin_port = htons(portno);
+    recvAddr.sin_family = AF_INET;
+    recvAddr.sin_addr.s_addr = INADDR_ANY;
+    recvAddr.sin_port = htons(portno);
 
-    if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
+    if (bind(sockfd, (struct sockaddr *) &recvAddr, sizeof(recvAddr)) < 0) {
         error("ERROR on binding");
     }
-
-    clilen = sizeof(cli_addr);
 
     /****** Kill Zombie Processes ******/
     sa.sa_handler = sigchld_handler; // reap all dead processes
@@ -151,28 +183,22 @@ int main(int argc, char *argv[])
         error("gethostbyname failed");
     }
 
-    char* serverAddress = inet_ntoa( (struct in_addr) *((struct in_addr *) server->h_addr));
-    Packet requestPacket(-1, REQUEST_PACKET, filename, strlen(filename));
+    char* serverIpAddress = inet_ntoa( (struct in_addr) *((struct in_addr *) server->h_addr));
+    Packet requestPacket(-1, REQUEST_PACKET, filename, strlen(filename)+1);
 
-    printf("IP for hostname %s: %s\n", serverName, serverAddress);
+    printf("IP for hostname %s: %s\n", serverName, serverIpAddress);
 
-    // send request packet to server
-    struct sockaddr_in dest_addr;
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(serverPort);
-    dest_addr.sin_addr.s_addr = inet_addr(serverAddress);
+    // fill in server (sender) details
+    struct sockaddr_in destAddr;
+    destAddr.sin_family = AF_INET;
+    destAddr.sin_port = htons(serverPort);
+    destAddr.sin_addr.s_addr = inet_addr(serverIpAddress);
 
-    int length;
-    string msg(requestPacket.serialize(&length));
-    printf("Message string: %s\n", msg.c_str());
+    send_packet(requestPacket, sockfd, destAddr);
 
-    int bytesSent = sendto(sockfd, msg.c_str(), length+1, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-
-    if (bytesSent < 0) {
-        error("ERROR on sending request");
-    }
-
-    time_t t = time(0);  
+    struct timeval timeVal;
+    gettimeofday(&timeVal, NULL);
+    unsigned long t = timeVal.tv_usec/1000 + timeVal.tv_sec*1000;
 
     char packetData[2048];
     int packetDataLength;
@@ -180,99 +206,62 @@ int main(int argc, char *argv[])
     vector<Packet> packets;
 
     while (1) {
-        packetDataLength = recvfrom(sockfd, packetData, 2048, 0, (struct sockaddr *) &cli_addr, &clilen);
-        if (packetDataLength < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                error("ERROR on recvfrom");
-            }
-            continue;
-        }
-        else if (packetDataLength > 0) {
-            Packet pkt(packetData, packetDataLength);
-            printf("Got data packet with SEQ number: %d\n", pkt.getSeqNum());
-            if (pkt.getSeqNum() == (expectedSeqNum * DATA_LEN)) {
-                packets.push_back(pkt);
-                if (pkt.isEOF()) {
-                    save_file_and_exit(packets, filename, sockfd, dest_addr);
-                }
-                expectedSeqNum += 1;
-                Packet ackPkt(-1, expectedSeqNum * DATA_LEN, NULL, 0);
-                printf("Sending ACK with ACK number: %d\n", ackPkt.getAckNum());
-                int serializedLength;
-                char* buffer = ackPkt.serialize(&serializedLength);
-                bytesSent = sendto(sockfd, (void*)buffer, serializedLength, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        packetDataLength = recvfrom(sockfd, packetData, 2048, 0, (struct sockaddr *) &servAddr, &servLen);
 
-                if (bytesSent < 0) {
-                    error("ERROR on sending ack");
-                }
-            }
-            t = time(0);
-            break;
-        }
-        if (time(0) - t > TIMEOUT) {
-            printf("TIMEOUT on request\n");
-            bytesSent = sendto(sockfd, msg.c_str(), length+1, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-
-            if (bytesSent < 0) {
-                error("ERROR on sending request");
-            }
-            t = time(0);
-        }
-    }
-
-    while (1) {
-        packetDataLength = recvfrom(sockfd, packetData, 2048, 0, (struct sockaddr *) &cli_addr, &clilen);
-        int r = (rand() % 10) + 1;
-        if (r < 2) {
-            continue;
-        }
 
         if (packetDataLength < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 error("ERROR on recvfrom");
             }
-
-            if (time(0) - t > TIMEOUT) {
-                printf("TIMEOUT, haven't received expected data\n");
-                Packet ackPkt(-1, expectedSeqNum * DATA_LEN, NULL, 0);
-                int serializedLength;
-                char* buffer = ackPkt.serialize(&serializedLength);
-                printf("Sending ACK with ACK number: %d\n", ackPkt.getAckNum());
-                bytesSent = sendto(sockfd, (void*)buffer, serializedLength, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-
-                if (bytesSent < 0) {
-                    error("ERROR on sending ack");
+            gettimeofday(&timeVal, NULL);
+            long now = timeVal.tv_usec/1000 + timeVal.tv_sec*1000;
+            if (now - t > TIMEOUT) {
+                printf("TIMEOUT waiting for data\n");
+                if (expectedSeqNum == 0) {
+                    printf("RETRANSMISSION: ");
+                    send_packet(requestPacket, sockfd, destAddr);
                 }
-                t = time(0);
+                else {
+                    Packet ackPkt(-1, expectedSeqNum, NULL, 0);
+                    printf("RETRANSMISSION: ");
+                    send_packet(ackPkt, sockfd, destAddr);
+                }
+                t = now;
             }
-            
-            continue;
         }
-        // TODO remember to check for DATA_PACKET packet type and ignore others
         else if (packetDataLength > 0) {
-            Packet pkt(packetData, packetDataLength);
-            if (pkt.getSeqNum() == (expectedSeqNum * DATA_LEN)) {
-                printf("Got data packet with SEQ number: %d\n", pkt.getSeqNum());
-                packets.push_back(pkt);
-                if (pkt.isEOF()) {
-                    save_file_and_exit(packets, filename, sockfd, dest_addr);
+            if (servAddr.sin_port == destAddr.sin_port && servAddr.sin_addr.s_addr == destAddr.sin_addr.s_addr) {
+                Packet pkt(packetData, packetDataLength);
+                // simulate corruption and packet loss
+                int r = (rand() % 100) + 1;
+                if (r <= PROBABILITY_PACKET_LOST * 100) {
+                    continue;
                 }
-                expectedSeqNum += 1;
-                Packet ackPkt(-1, expectedSeqNum * DATA_LEN, NULL, 0);
-                printf("Sending ACK with ACK number: %d\n", ackPkt.getAckNum());
-                int serializedLength;
-                char* buffer = ackPkt.serialize(&serializedLength);
-                bytesSent = sendto(sockfd, (void*)buffer, serializedLength, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-
-                if (bytesSent < 0) {
-                    error("ERROR on sending ack");
+                r = (rand() % 100) + 1;
+                if (r <= PROBABILITY_PACKET_CORRUPT * 100) {
+                    pkt.setSeqNum(pkt.getSeqNum() + 1);
+                }
+                if (pkt.isData()) {
+                    if (pkt.getSeqNum() == expectedSeqNum && !pkt.isCorrupt()) {
+                        printf("Got DATA packet with SEQ number: %d\n", pkt.getSeqNum());
+                        packets.push_back(pkt);
+                        if (pkt.isEOF()) {
+                            save_file_and_exit(packets, filename, sockfd, destAddr);
+                        }
+                        expectedSeqNum += pkt.getDataLen();
+                        Packet ackPkt(-1, expectedSeqNum, NULL, 0);
+                        gettimeofday(&timeVal, NULL);
+                        t = timeVal.tv_usec/1000 + timeVal.tv_sec*1000;
+                        send_packet(ackPkt, sockfd, destAddr);
+                    }
+                    else {
+                        Packet ackPkt(-1, expectedSeqNum, NULL, 0);
+                        printf("Got out of order packet. Resending ACK with ACKNUM %d\n", ackPkt.getAckNum());
+                        send_packet(ackPkt, sockfd, destAddr);
+                    }
                 }
             }
-            t = time(0);
-            continue;
         }
     }
-
-    printf("hit end of main function\n");
     return 0; /* we never get here */
 }

@@ -12,7 +12,7 @@ process for each connection
 #include <sys/wait.h> /* for the waitpid() system call */
 #include <signal.h> /* signal name macros, and the kill() prototype */
 #include <unistd.h>
-#include <time.h>
+#include <sys/time.h>
 #include <iostream>
 #include <sys/fcntl.h>
 #include <errno.h>
@@ -50,28 +50,35 @@ file_to_str(FILE* file, int* len) {
 }
 
 bool
-send_nth_packet(int n, char* fileContents, int fileLength, int sockfd, struct sockaddr_in cli_addr, socklen_t clilen) {
-    if ((n+1) * DATA_LEN > fileLength) {
-        eofPosition = n;
-        Packet pkt(n*DATA_LEN, EOF_PACKET, fileContents + n*DATA_LEN, fileLength - n*DATA_LEN);
+send_pkt_with_seq_num(int seqNum, char* fileContents, int fileLength, int sockfd, struct sockaddr_in cliAddr, int windowEnd) {
+    if (seqNum + DATA_LEN > fileLength && fileLength <= windowEnd) {
+        eofPosition = fileLength;
+        Packet pkt(seqNum, EOF_PACKET, fileContents + seqNum, fileLength - seqNum);
+        printf("Sending data packet with SEQUENCE NUMBER: %d\n", pkt.getSeqNum());
         int serializedLength;
         char* buffer = pkt.serialize(&serializedLength);
-        int err = sendto(sockfd, (void*)buffer, serializedLength, 0, (struct sockaddr *) &cli_addr, clilen);
-        if (err < 0) {
-            error("ERROR on send_nth_packet");
-        }
+        int err = sendto(sockfd, (void*)buffer, serializedLength, 0, (struct sockaddr *) &cliAddr, sizeof(cliAddr));
         free(buffer);
+        if (err < 0) {
+            error("ERROR on send_pkt_with_seq_num");
+        }
         return false;
     }
     else {
-        Packet pkt(n*DATA_LEN, DATA_PACKET, fileContents + n*DATA_LEN, DATA_LEN);
+        int pktLength;
+        if (seqNum + DATA_LEN > windowEnd)
+            pktLength = windowEnd - seqNum;
+        else
+            pktLength = DATA_LEN;
+        Packet pkt(seqNum, DATA_PACKET, fileContents + seqNum, pktLength);
+        printf("Sending data packet with SEQUENCE number: %d\n", pkt.getSeqNum());
         int serializedLength;
         char* buffer = pkt.serialize(&serializedLength);
-        int err = sendto(sockfd, (void*)buffer, serializedLength, 0, (struct sockaddr *) &cli_addr, clilen);
-        if (err < 0) {
-            error("ERROR on send_nth_packet");
-        }
+        int err = sendto(sockfd, (void*)buffer, serializedLength, 0, (struct sockaddr *) &cliAddr, sizeof(cliAddr));
         free(buffer);
+        if (err < 0) {
+            error("ERROR on send_pkt_with_seq_num");
+        }
     }
     return true;
 }
@@ -81,7 +88,7 @@ int main(int argc, char *argv[])
     srand(time(0));
     int sockfd, newsockfd, portno, pid;
     socklen_t clilen;
-    struct sockaddr_in serv_addr, cli_addr;
+    struct sockaddr_in serv_addr, cliAddr;
     struct sigaction sa;          // for signal SIGCHLD
 
     if (argc < 2) {
@@ -103,7 +110,7 @@ int main(int argc, char *argv[])
         error("ERROR on binding");
     }
 
-    clilen = sizeof(cli_addr);
+    clilen = sizeof(cliAddr);
 
     /****** Kill Zombie Processes ******/
     sa.sa_handler = sigchld_handler; // reap all dead processes
@@ -119,30 +126,35 @@ int main(int argc, char *argv[])
     int windowStart = 0;
     int currentClientPort = -1;
     unsigned long currentClientIp = -1;
-    time_t t;
+
+    struct timeval timeVal;
+    long t;
     while (1) {
         char packetData[2048];
-        int packetDataLength = recvfrom(sockfd, packetData, 2048, 0, (struct sockaddr *) &cli_addr, &clilen);
+        int packetDataLength = recvfrom(sockfd, packetData, 2048, 0, (struct sockaddr *) &cliAddr, &clilen);
 
-        int r = (rand() % 10) + 1;
-        if (r < 2) {
-            continue;
-        }
 
         if (packetDataLength < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 error("ERROR on recvfrom");
             }
-            if (currentClientPort != -1 && time(0) - t > TIMEOUT) {
+
+            gettimeofday(&timeVal, NULL);
+            long now = timeVal.tv_usec/1000 + timeVal.tv_sec*1000;
+
+            if (currentClientPort != -1 && now - t > TIMEOUT) {
                 printf("TIMEOUT on ACK\n");
                 int stop;
                 if (eofPosition != -1)
-                    stop = eofPosition + 1;
+                    stop = eofPosition;
                 else
                     stop = windowStart + WINDOW_SIZE;
-                t = time(0);
-                for (int i = windowStart; i < stop; i++) {
-                    if (!send_nth_packet(i, fileContents, fileLength, sockfd, cli_addr, clilen))
+
+                t = now;
+
+                for (int i = windowStart; i < stop; i+=DATA_LEN) {
+                    printf("RETRANSMISSION: ");
+                    if (!send_pkt_with_seq_num(i, fileContents, fileLength, sockfd, cliAddr, stop)) 
                         break;
                 }
            
@@ -151,7 +163,21 @@ int main(int argc, char *argv[])
         }
 
         Packet rcvdPacket(packetData, packetDataLength);
-        printf("source port: %d\n", htons(cli_addr.sin_port));
+
+        // simulate corruption and packet loss
+        int r = (rand() % 100) + 1;
+        if (r <= PROBABILITY_PACKET_LOST * 100) {
+            continue;
+        }
+        r = (rand() % 100) + 1;
+        if (r <= PROBABILITY_PACKET_CORRUPT * 100) {
+            rcvdPacket.setAckNum(rcvdPacket.getAckNum() + 1);
+        }
+
+        if (rcvdPacket.isCorrupt()) {
+            printf("corrupt\n");
+            continue;
+        }
 
         // potentially need to handle receiving a request packet in the middle of handling a request
         if (rcvdPacket.isRequest() && currentClientPort == -1) {
@@ -163,27 +189,38 @@ int main(int argc, char *argv[])
                 Packet responsePacket(0, NOT_FOUND_PACKET, NULL, 0);
                 int serializedLength;
                 char* buffer = responsePacket.serialize(&serializedLength);
-                int err = sendto(sockfd, (void*)buffer, serializedLength, 0, (struct sockaddr *) &cli_addr, clilen);
+                int err = sendto(sockfd, (void*)buffer, serializedLength, 0, (struct sockaddr *) &cliAddr, clilen);
                 if (err < 0)
                     error("ERROR on FNF sendto");
                 free(buffer);
                 continue;
             }
 
-            currentClientPort = htons(cli_addr.sin_port);
-            currentClientIp = cli_addr.sin_addr.s_addr;
+            currentClientPort = htons(cliAddr.sin_port);
+            currentClientIp = cliAddr.sin_addr.s_addr;
 
             fileContents = file_to_str(file, &fileLength);
+            fclose(file);
+
             printf("File Length: %d\n", fileLength);
-            t = time(0);
-            for (int i = 0; i < WINDOW_SIZE; i++) {
-                if (!send_nth_packet(i, fileContents, fileLength, sockfd, cli_addr, clilen))
+
+            gettimeofday(&timeVal, NULL);
+            t = timeVal.tv_usec/1000 + timeVal.tv_sec*1000;
+
+            for (int i = 0; i < WINDOW_SIZE; i+=DATA_LEN) {
+                if (!send_pkt_with_seq_num(i, fileContents, fileLength, sockfd, cliAddr, windowStart + WINDOW_SIZE)) {
                     break;
+                }
             }
         }
         else if (rcvdPacket.isEOF_ACK()) {
-            if (htons(cli_addr.sin_port) == currentClientPort && cli_addr.sin_addr.s_addr == currentClientIp) {
-                // reset variables
+            // first EOF ACK from receiver -> reset some state variables
+            printf("Source port: %d\nSource Address: %d\nCurrent Client Port: %d\nCurrent Client Ip: %d\n",
+                htons(cliAddr.sin_port),
+                cliAddr.sin_addr.s_addr,
+                currentClientPort,
+                currentClientIp);
+            if (htons(cliAddr.sin_port) == currentClientPort && cliAddr.sin_addr.s_addr == currentClientIp) {
                 free(fileContents);
                 fileLength = 0;
                 windowStart = 0;
@@ -193,30 +230,35 @@ int main(int argc, char *argv[])
             }
 
             Packet pkt(-1, EOF_ACK, NULL, 0);
+            printf("RETRANSMISSION: Sending EOF_ACK\n");
             int serializedLength;
             char* ackbuf = pkt.serialize(&serializedLength);
-            int bytesSent = sendto(sockfd, (void*)ackbuf, serializedLength, 0, (struct sockaddr *)&cli_addr, clilen);
+            int bytesSent = sendto(sockfd, (void*)ackbuf, serializedLength, 0, (struct sockaddr *)&cliAddr, clilen);
+            free(ackbuf);
 
             if (bytesSent < 0) {
                 error("ERROR on sending ack");
             }
         }
         else if (rcvdPacket.isACK()) {
-            printf("Received ACK packet with ACK number %d\n", rcvdPacket.getAckNum());
-            printf("Window Start: %d\n", windowStart);
-            int ackNumDivided = rcvdPacket.getAckNum()/DATA_LEN;
-            if (ackNumDivided > windowStart) {
+            int ackNum = rcvdPacket.getAckNum();
+            if (ackNum > windowStart) {
+                printf("Received ACK packet with ACK number %d\n", rcvdPacket.getAckNum());
                 int stop;
                 if (eofPosition != -1)
-                    stop = eofPosition + 1;
+                    stop = eofPosition;
                 else
-                    stop = windowStart + WINDOW_SIZE;
-                t = time(0);
-                for (int i = windowStart + WINDOW_SIZE; i < stop; i++) {
-                    if (!send_nth_packet(i, fileContents, fileLength, sockfd, cli_addr, clilen))
+                    stop = ackNum + WINDOW_SIZE;
+
+                gettimeofday(&timeVal, NULL);
+                t = timeVal.tv_usec/1000 + timeVal.tv_sec*1000;
+
+                for (int i = windowStart + WINDOW_SIZE; i < stop; i+=DATA_LEN) {
+                    if (!send_pkt_with_seq_num(i, fileContents, fileLength, sockfd, cliAddr, stop))
                         break;
                 }
-                windowStart = ackNumDivided;
+                windowStart = ackNum;
+                printf("Window Start: %d\n", windowStart);
             }
         }
 
